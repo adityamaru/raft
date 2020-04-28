@@ -67,6 +67,30 @@ type Node struct {
 	mu sync.Mutex
 }
 
+// CreateNewNode returns an instance of a node which will participate in the
+// raft group.
+func CreateNewNode(id int, participantNodes []int, server *Server, connectedToAllParticipants <-chan interface{}) *Node {
+	node := new(Node)
+	node.id = id
+	node.participantNodes = participantNodes
+	node.server = server
+	node.state = follower
+	node.votedFor = -1
+
+	// The node must be connected to all of its peer before it can start its
+	// election timer.
+	go func() {
+		<-connectedToAllParticipants
+		node.mu.Lock()
+		node.timeSinceTillLastReset = time.Now()
+		node.mu.Unlock()
+
+		node.startElectionTimer()
+	}()
+
+	return node
+}
+
 // RequestVoteArgs are the arguments for the RequestVote RPC.
 type RequestVoteArgs struct {
 	term         int
