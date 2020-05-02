@@ -62,7 +62,7 @@ func (server *Server) StartServer() {
 		log.Fatal(err)
 	}
 
-	log.Print("Server for node %d is listening at %s", server.nodeID, server.listener.Addr)
+	log.Printf("Server for node %d is listening at %s", server.nodeID, server.listener.Addr)
 	server.mu.Unlock()
 
 	server.waitGroup.Add(1)
@@ -125,7 +125,7 @@ func (rpcMethods *RPCMethods) RequestVote(args RequestVoteArgs, reply *RequestVo
 	return rpcMethods.node.RequestVote(args, reply)
 }
 
-// // AppendEntries is a wrapper.
-// func (rpcMethods *RPCMethods) AppendEntries(args RequestVoteArgs, reply *RequestVoteReply) error {
-// 	return rpcMethods.node.RequestVote(args, reply)
-// }
+// AppendEntries is a wrapper.
+func (rpcMethods *RPCMethods) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	return rpcMethods.node.AppendEntries(args, reply)
+}

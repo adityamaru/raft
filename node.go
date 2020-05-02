@@ -4,6 +4,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,14 +114,14 @@ func (node *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) err
 		return nil
 	}
 
-	log.Print("RequestVote args: %+v\ncurrentTerm=%d\nvotedFor=%d", args, node.currentTerm, node.votedFor)
+	log.Printf("RequestVote args: %+v\ncurrentTerm=%d\nvotedFor=%d", args, node.currentTerm, node.votedFor)
 
 	// If the RPC term is less than the current term then we must reject the
 	// vote request.
 	if args.term < node.currentTerm {
 		reply.term = node.currentTerm
 		reply.voteGranted = false
-		log.Print("RequestVote has been rejected by %d", node.id)
+		log.Printf("RequestVote has been rejected by %d", node.id)
 		return nil
 	}
 
@@ -139,7 +140,55 @@ func (node *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) err
 		reply.voteGranted = false
 	}
 	reply.term = node.currentTerm
-	log.Print("RequestVote reply: %+v", reply)
+	log.Printf("RequestVote reply: %+v", reply)
+	return nil
+}
+
+// AppendEntriesArgs is the argument sent in an AppendEntries RPC.
+type AppendEntriesArgs struct {
+	term         int
+	leaderID     int
+	prevLogIndex int // index of log entry immediately preceding new ones.
+	prevLogTerm  int // term of prevLogIndex entry.
+	entries      []LogEntry
+	leaderCommit int // leaders commitIndex.
+}
+
+// AppendEntriesReply is the respnse sent by an AppendEntries RPC.
+type AppendEntriesReply struct {
+	term    int
+	success bool // true if the follower contained an entry matching prevLogIndex and prevLogTerm.
+}
+
+// AppendEntries is the RPC logic.
+// TODO(adityamaru): This does not yet handle any of the log replication logic.
+func (node *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.state == dead {
+		return nil
+	}
+
+	log.Printf("AppendEntries args: %+v\ncurrentTerm=%d\n", args, node.currentTerm)
+	// If the AppendEntries RPC is from a higher term then both followers and
+	// candidates need to be reset.
+	if args.term > node.currentTerm {
+		node.updateStateToFollower(args.term)
+	}
+
+	if args.term == node.currentTerm {
+		if node.state != follower {
+			node.updateStateToFollower(args.term)
+		}
+		// Reset election timer since we have received a heartbeat from the leader.
+		node.timeSinceTillLastReset = time.Now()
+		reply.success = true
+	}
+	reply.term = node.currentTerm
+	// By default but for readabilty.
+	reply.success = false
+	log.Printf("AppendEntries reply: %+v", reply)
 	return nil
 }
 
@@ -183,13 +232,19 @@ func (node *Node) startElectionTimer() {
 		<-ticker.C
 
 		node.mu.Lock()
-		if node.state != candidate || node.state != follower {
-			log.Print("The node is in the %s state, no need to run election", node.state)
+		if node.state != candidate && node.state != follower {
+			log.Printf("The node is in the %s state, no need to run election", node.state)
 			node.mu.Unlock()
 			return
 		}
 
-		// Some logic about the timer having been started in a previous term.
+		// If the timer was started in a previous term then we can back off
+		// because a newer go routine would have been spawned cooresponding to
+		// the new term.
+		if node.currentTerm != timerStartTerm {
+			log.Printf("Election timer started in term %d but now node has latest term %d, so we can back off", timerStartTerm, node.currentTerm)
+			return
+		}
 
 		// Run an election if we have reached the election timeout.
 		if timePassed := time.Since(node.timeSinceTillLastReset); timePassed > electionTimeout {
@@ -206,13 +261,110 @@ func (node *Node) startElectionTimer() {
 // Assumes mu is held when this method is invoked.
 func (node *Node) runElection() {
 	node.currentTerm++
+	currentTerm := node.currentTerm
 	node.state = candidate
 	node.votedFor = node.id
 	node.timeSinceTillLastReset = time.Now()
 
-	log.Print("Node %d has become a candidate with currentTerm=%d", node.id, node.currentTerm)
+	log.Printf("Node %d has become a candidate with currentTerm=%d", node.id, node.currentTerm)
 
-	votesReceived := 0
+	// We vote for ourselves.
+	var votesReceived int32 = 1
 
-	// Sen
+	// Send votes to all the other machines in the raft group.
+	for _, nodeID := range node.participantNodes {
+		go func(id int) {
+			voteRequestArgs := RequestVoteArgs{
+				term:        currentTerm,
+				candidateID: id,
+			}
+
+			var reply RequestVoteReply
+			log.Printf("Sending a RequestVote to %d with args %+v", id, voteRequestArgs)
+
+			if err := node.server.Call(id, "Node.RequestVote", voteRequestArgs, &reply); err == nil {
+				log.Printf("Received a response for RequestVote from node %d saying %+v, for the election started by node %d", id, reply, node.id)
+
+				node.mu.Lock()
+				defer node.mu.Unlock()
+
+				// If the state of the current node has changed by the time the election response arrives then we must back off.
+				if node.state != candidate {
+					log.Printf("The state of node %d has changed from candidate to %s while waiting for an election response", node.id, node.state)
+					return
+				}
+
+				// If the node responds with a higher term then we must back off from the election.
+				if reply.term > currentTerm {
+					node.updateStateToFollower(reply.term)
+					return
+				}
+
+				if reply.term == currentTerm {
+					if reply.voteGranted {
+						votes := int(atomic.AddInt32(&votesReceived, 1))
+						// Check for majority votes having been received.
+						if votes > (len(node.participantNodes)+1)/2 {
+							log.Printf("The election has been won by node %d", node.id)
+							node.updateStateToLeader()
+							return
+						}
+					}
+				}
+			}
+		}(nodeID)
+	}
+}
+
+func (node *Node) sendLeaderHeartbeats() {
+	node.mu.Lock()
+	currentTerm := node.currentTerm
+	node.mu.Unlock()
+	for _, nodeID := range node.participantNodes {
+		appendEntriesArg := AppendEntriesArgs{
+			term:     currentTerm,
+			leaderID: node.id,
+		}
+		go func(id int) {
+			var reply AppendEntriesReply
+			log.Printf("Sending a AppendEntries to %d with args %+v", id, appendEntriesArg)
+
+			if err := node.server.Call(id, "Node.AppendEntries", appendEntriesArg, &reply); err == nil {
+				log.Printf("Received a response for AppendEntries from node %d saying %+v", id, reply)
+
+				if reply.term > currentTerm {
+					log.Printf("Leader %d is backing off cause it received a higher term reply", reply.term)
+					node.mu.Lock()
+					node.updateStateToFollower(reply.term)
+					node.mu.Unlock()
+					return
+				}
+			}
+		}(nodeID)
+	}
+}
+
+// Assumes mutex mu is held when this method is called.
+func (node *Node) updateStateToLeader() {
+	node.state = leader
+	log.Printf("Node %d has become the leader", node.id)
+
+	go func() {
+
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			node.sendLeaderHeartbeats()
+			<-ticker.C
+			node.mu.Lock()
+			// The node is no longer the leader so we can back off from sending
+			// heartbeats.
+			if node.state != leader {
+				node.mu.Unlock()
+				return
+			}
+			node.mu.Unlock()
+		}
+	}()
 }
