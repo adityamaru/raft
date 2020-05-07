@@ -406,6 +406,9 @@ func (node *Node) sendLeaderHeartbeats() {
 						node.nextIndex[id] = nextLogIndex + len(entries)
 						node.matchIndex[id] = node.nextIndex[id] - 1
 						log.Printf("Append entries reply from node %d. Succeeded nextIndex: %d matchIndex: %d", id, node.nextIndex[id], node.matchIndex[id])
+
+						// The leader must check if a log entry can be considered committed.
+
 					} else {
 						node.nextIndex[id] = node.nextIndex[id] - 1
 						log.Printf("Append entries reply from node %d. Failed nextIndex reduced to %d", id, node.nextIndex[id])
