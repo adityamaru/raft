@@ -161,7 +161,6 @@ type AppendEntriesReply struct {
 }
 
 // AppendEntries is the RPC logic.
-// TODO(adityamaru): This does not yet handle any of the log replication logic.
 func (node *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	node.mu.Lock()
 	defer node.mu.Unlock()
@@ -183,6 +182,46 @@ func (node *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRepl
 		}
 		// Reset election timer since we have received a heartbeat from the leader.
 		node.timeSinceTillLastReset = time.Now()
+
+		// Compare prevLogIndex and prevLogTerm with our own log.
+		if args.prevLogIndex == -1 || (args.prevLogIndex < len(node.log) && args.prevLogTerm == node.log[args.prevLogIndex].term) {
+			reply.success = true
+
+			// Find an existing entry that conflicts with the leader sent entries, and remove everything from it till the end.
+			nodeLogIndex := args.prevLogIndex + 1
+			leaderLogIndex := 0
+			for {
+				if nodeLogIndex >= len(node.log) {
+					break
+				}
+
+				if leaderLogIndex >= len(args.entries) {
+					break
+				}
+
+				// Found a mismatch so we need to overwrite from this index onwards.
+				if args.entries[leaderLogIndex].term != node.log[nodeLogIndex].term {
+					break
+				}
+
+				nodeLogIndex++
+				leaderLogIndex++
+			}
+
+			// There are still some log entries which the leader needs to inform us about.
+			if leaderLogIndex < len(args.entries) {
+				log.Printf("The node %d has an old log %+v", node.id, node.log)
+				node.log = append(node.log[:nodeLogIndex], args.entries[leaderLogIndex:]...)
+				log.Printf("The node %d has a new log %+v", node.id, node.log)
+			}
+
+			if args.leaderCommit > node.commitIndex {
+				node.commitIndex = intMin(args.leaderCommit, len(node.log)-1)
+				log.Printf("The commit index node %d has been changed to %d", node.id, node.commitIndex)
+				// Indicate to the client that this follower has committed new entries.
+			}
+		}
+
 		reply.success = true
 	}
 	reply.term = node.currentTerm
@@ -192,6 +231,14 @@ func (node *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRepl
 	return nil
 }
 
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
 // This method is responsible for resetting the nodes state to follower. The
 // mutex mu must be held before invoking this method.
 func (node *Node) updateStateToFollower(latestTerm int) {
@@ -199,7 +246,6 @@ func (node *Node) updateStateToFollower(latestTerm int) {
 	node.state = follower
 	node.votedFor = -1
 
-	// Reset and restart the election timer.
 	node.timeSinceTillLastReset = time.Now()
 
 	// Start the followers election timer concurrently.
@@ -321,11 +367,26 @@ func (node *Node) sendLeaderHeartbeats() {
 	currentTerm := node.currentTerm
 	node.mu.Unlock()
 	for _, nodeID := range node.participantNodes {
-		appendEntriesArg := AppendEntriesArgs{
-			term:     currentTerm,
-			leaderID: node.id,
-		}
 		go func(id int) {
+			node.mu.Lock()
+			nextLogIndex := node.nextIndex[id]
+			prevLogIndex := nextLogIndex - 1
+			var prevLogTerm int
+			if prevLogIndex >= 0 {
+				prevLogTerm = node.log[prevLogIndex].term
+			}
+			entries := node.log[nextLogIndex:]
+
+			appendEntriesArg := AppendEntriesArgs{
+				term:         currentTerm,
+				leaderID:     node.id,
+				prevLogIndex: prevLogIndex,
+				prevLogTerm:  prevLogTerm,
+				entries:      entries,
+				leaderCommit: node.commitIndex,
+			}
+			node.mu.Unlock()
+
 			var reply AppendEntriesReply
 			log.Printf("Sending a AppendEntries to %d with args %+v", id, appendEntriesArg)
 
@@ -338,6 +399,17 @@ func (node *Node) sendLeaderHeartbeats() {
 					node.updateStateToFollower(reply.term)
 					node.mu.Unlock()
 					return
+				}
+
+				if node.state == leader && currentTerm == reply.term {
+					if reply.success {
+						node.nextIndex[id] = nextLogIndex + len(entries)
+						node.matchIndex[id] = node.nextIndex[id] - 1
+						log.Printf("Append entries reply from node %d. Succeeded nextIndex: %d matchIndex: %d", id, node.nextIndex[id], node.matchIndex[id])
+					} else {
+						node.nextIndex[id] = node.nextIndex[id] - 1
+						log.Printf("Append entries reply from node %d. Failed nextIndex reduced to %d", id, node.nextIndex[id])
+					}
 				}
 			}
 		}(nodeID)
@@ -367,4 +439,21 @@ func (node *Node) updateStateToLeader() {
 			node.mu.Unlock()
 		}
 	}()
+}
+
+// Submit is the method used by the `client` to submit commands to the Raft leader.
+func (node *Node) Submit(command interface{}) bool {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.state == leader {
+		logEntry := LogEntry{
+			term:    node.currentTerm,
+			Command: command,
+		}
+		node.log = append(node.log, logEntry)
+		log.Printf("Leader %d has receieved a command %+v", node.id, logEntry)
+		return true
+	}
+	return false
 }

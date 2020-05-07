@@ -62,7 +62,7 @@ func (server *Server) StartServer() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Server for node %d is listening at %s", server.nodeID, server.listener.Addr)
+	log.Printf("Server for node %d is listening at %s", server.nodeID, server.listener.Addr())
 	server.mu.Unlock()
 
 	server.waitGroup.Add(1)
